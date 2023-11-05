@@ -1,9 +1,10 @@
 from wallet import Wallet, web3
-from token_abi import SWAPV3_ADDRESS, SWAPV3_ABI, TOKEN_ABI, SWAPV2_ADDRESS, SWAPV2_ABI
+from token_abi import SWAPV3_ADDRESS, SWAPV3_ABI, TOKEN_ABI, SWAPV2_ADDRESS, SWAPV2_ABI, PAYC_PROXY_ABI
 import threading
 import datetime
 from data import write_data
 import time
+import math
 import uuid
 
 class Operation:
@@ -46,7 +47,7 @@ class Operation:
                 
             self.active = True
             self.log(f"\033[33m*** Operation Started with \033[35m{len(self.wallets)}\033[33m Wallets ***\033[0m\n")
-            print(f"\n\033[33m*** Operation Started with \033[35m{len(self.wallets)}\033[33m Wallets ***\033[0m\n")
+            print(f"\033[33m*** Operation Started with \033[35m{len(self.wallets)}\033[33m Wallets ***\033[0m\n")
             threading.Thread(target=trigger_flag).start()
             
         
@@ -54,13 +55,13 @@ class Operation:
                 while(wallet.active):
                     if(self.buy_flag.is_set() == True and (wallet.previous_operation == 'sell' or wallet.previous_operation == '')):
                         self.buy(wallet)
+                        self.previous = 'buy'
                         wallet.previous_operation = 'buy'
-                        wallet.operation = 'Waiting Sell'
                         self.buy_flag.clear()
                     if(self.sell_flag.is_set() == True and (wallet.previous_operation == 'buy' or wallet.previous_operation == '')):
                         self.sell(wallet)
+                        self.previous = 'sell'
                         wallet.previous_operation = 'sell'
-                        wallet.operation('Waiting Buy')
                         self.sell_flag.clear()
              
 
@@ -69,6 +70,8 @@ class Operation:
         for wallet in self.wallets:
             wallet.active = False
             wallet.operation = None
+            time.sleep(1)
+            wallet.previous_operation = ''
 
     def get_token_actual_price(self):
         token_decimals = self.token_contract.functions.decimals().call()
@@ -80,21 +83,28 @@ class Operation:
         self.token_price = float(amountOut)
         return self.token_price
 
+    def remove_wallet(self, wallet: Wallet):
+        wallet.active = False
+        wallet.operation = None
+        time.sleep(1)
+        wallet.previous_operation = ''
+        self.wallets.remove(wallet)
+        self.log(f'Wallet: {wallet.name} -- {wallet.address} Removed From operation!')
+
     def add_wallet(self, wallet: Wallet):
         if wallet not in self.wallets:
             self.wallets.append(wallet)
-            if self.active == True:
-                if not self.get_token_balance(wallet):
-                    wallet.operation = 'Waiting Buy'
-                    wallet.previous_operation = 'sell'
-                else:  
-                    wallet.operation = 'Waiting (Buy or Sell)'
+            wallet.operation = self.id
             wallet.active = True
+            if self.previous == 'buy':
+                self.buy(wallet)
+                wallet.previous_operation = 'buy'
 
             threading.Thread(target=self.operate_with_flag, args=(wallet,)).start()
-            self.log(f'\n\033[32mWallet Added\nOperation Active: \033[35m{self.active}! \033[32mhas \033[35m{len(self.wallets)} \033[32mWallets.\033[0m\n{wallet.name} -- {wallet.address}\n\033[0m')
+            self.log(f'\033[32m\nWallet Added\nOperation Active: \033[35m{self.active}! \033[32mhas \033[35m{len(self.wallets)} \033[32m\nWallets.\033[0m\n{wallet.name} -- {wallet.address}\n\033[0m')
         else:
-            self.log("\033[91mWallet Already in this Operation.\033[0m")
+            self.log(f"\033[91m\nWallet Already in this Operation.\033[0m -- {wallet.address}")
+            raise Exception(f"\033[31mError with: {wallet.name} -- {wallet.address} -- \033[33m\nWallet Already in Operation!\033[0m\n")
     
     def change_wbnb_amount(self, new_value: float):
         self.wbnb_amount = new_value
@@ -111,10 +121,11 @@ class Operation:
         wallet.add_token_balance(self.token_target, self.token_symbol, balance)
         return balance
     
-    def buy(self, wallet: Wallet) -> str:
+    def buy(self, wallet: Wallet, value=None) -> str:
         try:
             nonce = web3.eth.get_transaction_count(wallet.address, 'latest')
-            value = self.wbnb_amount
+            if value == None:
+                value = self.wbnb_amount
             contract = web3.eth.contract(address=SWAPV3_ADDRESS, abi=SWAPV3_ABI)
             pancakeswap3_txn = contract.functions.exactInputSingle({
                 'tokenIn': self.WBNB,
@@ -140,6 +151,7 @@ class Operation:
 
             # Wait for the transaction to be confirmed
             receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+            wallet.get_bnb_amount()
             if receipt['status'] == 1:
                 self.log(f"\033[32mTransaction Success! (Bought)\033[0m\nWallet: {wallet.name} -- {wallet.address}\nTransaction Hash: {receipt.transactionHash.hex()}\n")
                 
@@ -148,17 +160,21 @@ class Operation:
                 raise Exception(f"\033[91mTransaction Failed! (Buy)(\033[0m\n{receipt}\n")
             
         except Exception as e:
-            if 'nonce' in str(e) or '-32003' in str(e):
+            if 'nonce' in str(e) or '-32003' in str(e) and wallet.retry == 0:
                 # Handle nonce-related error
-                self.log("\033[31mNonce-related error: Retrying\033[0m\n")
-                self.buy(wallet)
+                self.log(f"\033[31mNonce-related error: Retrying\033[0m\nWallet: {wallet.name} --- {wallet.address}\n")
+                time.sleep(7)
+                self.buy(wallet, 0.000001)
+                wallet.retry = 1
             else:
                 # Handle other types of errors
                 index = self.wallets.index(wallet)
                 self.wallets.pop(index)
                 wallet.active = False
-                self.log(f"\033[31mError with: {wallet.name} -- {wallet.address} -- \033[33mWallet removed from Operation!\033[0m\n{e}\n ")
-        wallet.get_bnb_amount()
+                wallet.operation = None
+                time.sleep(1)
+                wallet.previous_operation = ''
+                self.log(f"\033[31mError with: {wallet.name} -- {wallet.address} -- \033[33m\nWallet removed from Operation!\033[0m\n{e}\n")
 
     def sell(self, wallet: Wallet):
         try:
@@ -169,7 +185,7 @@ class Operation:
             # Check token balance
             balance = token_contract.functions.balanceOf(wallet.address).call()
             if balance <= 0:
-                raise Exception("\033[31mInsufficient balance to perform the swap.\033[0m\n")
+                raise Exception("\033[31mInsufficient balance to perform the swap.\033[0m\nnWallet: {wallet.name} -- {wallet.address} ")
             
             # Approve PancakeSwap to spend a specific amount
             approval_amount = balance  # You can specify a different amount if needed
@@ -227,21 +243,18 @@ class Operation:
                 self.log(swap_receipt.transactionHash.hex()+'\n')
                 return swap_receipt
             else:
-                raise Exception(f"\033[91mTransaction Failed! (Sell)\033[0m {swap_receipt}\n")
+                raise Exception(f"\033[91mTransaction Failed! (Sell)\033[0m\nOperation: {self.id}{swap_receipt}\n")
             
         except Exception as e:
             index = self.wallets.index(wallet)
             self.wallets.pop(index)
             wallet.active = False
-            self.log(f"\033[31mError with: {wallet.name} -- {wallet.address} -- \033[33mWallet removed from Operation!\033[0m\n{e}\n ")
+            self.log(f"\033[31mError with: {wallet.name} -- {wallet.address} -- \033[33m\nWallet removed from Operation!\033[0m\n{e}\n ")
         wallet.get_bnb_amount()
         
     def log(self, message):
         # Esta função registra a mensagem no arquivo de log
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_message = f"{timestamp} - {message}\n"
+        log_message = f"Operation: {self.id} - {timestamp} - {message}\n"
         with open("log.txt", "a") as log_file:
             log_file.write(log_message)
-
-
-
